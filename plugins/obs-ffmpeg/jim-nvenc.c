@@ -104,6 +104,7 @@ struct nvenc_data {
 
 	DARRAY(struct nv_bitstream) bitstreams;
 	DARRAY(struct nv_texture) textures;
+	DARRAY(struct nv_buffer) buffers;
 	DARRAY(struct handle_tex) input_textures;
 	struct circlebuf dts_list;
 
@@ -222,6 +223,47 @@ static void nv_texture_free(struct nvenc_data *enc, struct nv_texture *nvtex)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Buffer Resource                                                           */
+
+struct nv_buffer {
+	void *ptr;
+	uint32_t width;
+	uint32_t height;
+};
+
+static bool nv_buffer_init(struct nvenc_data *enc, struct nv_buffer *nvbuf)
+{
+	const bool p010 = obs_p010_tex_active();
+
+	NV_ENC_CREATE_INPUT_BUFFER buf = {0};
+
+	buf.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+	buf.width = enc->cx;
+	buf.height = enc->cy;
+	buf.bufferFmt = p010 ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+			     : NV_ENC_BUFFER_FORMAT_NV12;
+
+	if (NV_FAILED(nv.nvEncCreateInputBuffer(enc->session, &buf))) {
+		if (buf.inputBuffer)
+			nv.nvEncDestroyInputBuffer(enc->session,
+						   buf.inputBuffer);
+		return false;
+	}
+
+	nvbuf->ptr = buf.inputBuffer;
+	nvbuf->width = buf.width;
+	nvbuf->height = buf.height;
+	return true;
+}
+
+static void nv_buffer_free(struct nvenc_data *enc, struct nv_buffer *nvbuf)
+{
+	if (nvbuf->ptr) {
+		nv.nvEncDestroyInputBuffer(enc->session, nvbuf->ptr);
+	}
+}
+
+/* ------------------------------------------------------------------------- */
 /* Implementation                                                            */
 
 static const char *h264_nvenc_get_name(void *type_data)
@@ -297,7 +339,7 @@ static HANDLE get_lib(struct nvenc_data *enc, const char *lib)
 
 typedef HRESULT(WINAPI *CREATEDXGIFACTORY1PROC)(REFIID, void **);
 
-static bool init_d3d11(struct nvenc_data *enc, obs_data_t *settings)
+static bool init_d3d11(struct nvenc_data *enc, obs_data_t *settings, UINT gpu)
 {
 	HMODULE dxgi = get_lib(enc, "DXGI.dll");
 	HMODULE d3d11 = get_lib(enc, "D3D11.dll");
@@ -329,7 +371,7 @@ static bool init_d3d11(struct nvenc_data *enc, obs_data_t *settings)
 		return false;
 	}
 
-	hr = factory->lpVtbl->EnumAdapters(factory, 0, &adapter);
+	hr = factory->lpVtbl->EnumAdapters(factory, gpu, &adapter);
 	factory->lpVtbl->Release(factory);
 	if (FAILED(hr)) {
 		error_hr("EnumAdapters failed");
@@ -1001,6 +1043,21 @@ static bool init_textures(struct nvenc_data *enc)
 	return true;
 }
 
+static bool init_buffers(struct nvenc_data *enc)
+{
+	da_reserve(enc->buffers, enc->buf_count);
+	for (int i = 0; i < enc->buf_count; i++) {
+		struct nv_buffer buffer;
+		if (!nv_buffer_init(enc, &buffer)) {
+			return false;
+		}
+
+		da_push_back(enc->buffers, &buffer);
+	}
+
+	return true;
+}
+
 static void nvenc_destroy(void *data);
 
 static bool init_specific_encoder(struct nvenc_data *enc, obs_data_t *settings,
@@ -1095,13 +1152,14 @@ static void *nvenc_create_internal(enum codec_type codec, obs_data_t *settings,
 		break;
 	}
 
+	const int gpu = (int)obs_data_get_int(settings, "gpu");
 	if (!init_nvenc(encoder)) {
 		goto fail;
 	}
 	if (NV_FAILED(nv_create_instance(&init))) {
 		goto fail;
 	}
-	if (!init_d3d11(enc, settings)) {
+	if (!init_d3d11(enc, settings, gpu)) {
 		goto fail;
 	}
 	if (!init_session(enc)) {
@@ -1114,6 +1172,9 @@ static void *nvenc_create_internal(enum codec_type codec, obs_data_t *settings,
 		goto fail;
 	}
 	if (!init_textures(enc)) {
+		goto fail;
+	}
+	if (!init_buffers(enc)) {
 		goto fail;
 	}
 
@@ -1130,15 +1191,6 @@ fail:
 static void *nvenc_create_base(enum codec_type codec, obs_data_t *settings,
 			       obs_encoder_t *encoder)
 {
-	/* this encoder requires shared textures, this cannot be used on a
-	 * gpu other than the one OBS is currently running on. */
-	const int gpu = (int)obs_data_get_int(settings, "gpu");
-	if (gpu != 0) {
-		blog(LOG_INFO,
-		     "[jim-nvenc] different GPU selected by user, falling back to ffmpeg");
-		goto reroute;
-	}
-
 	if (obs_encoder_scaling_enabled(encoder)) {
 		blog(LOG_INFO,
 		     "[jim-nvenc] scaling enabled, falling back to ffmpeg");
@@ -1177,17 +1229,60 @@ reroute:
 
 static void *h264_nvenc_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
+	/* this encoder requires shared textures, this cannot be used on a
+	 * gpu other than the one OBS is currently running on. */
+	const int gpu = (int)obs_data_get_int(settings, "gpu");
+	if (gpu != 0) {
+		blog(LOG_INFO,
+		     "[jim-nvenc] different GPU selected by user, falling back to CPU");
+		return obs_encoder_create_rerouted(encoder, "jim_nvenc_cpu");
+	}
 	return nvenc_create_base(CODEC_H264, settings, encoder);
 }
 
 #ifdef ENABLE_HEVC
 static void *hevc_nvenc_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
+	/* this encoder requires shared textures, this cannot be used on a
+	 * gpu other than the one OBS is currently running on. */
+	const int gpu = (int)obs_data_get_int(settings, "gpu");
+	if (gpu != 0) {
+		blog(LOG_INFO,
+		     "[jim-nvenc] different GPU selected by user, falling back to CPU");
+		return obs_encoder_create_rerouted(encoder,
+						   "jim_hevc_nvenc_cpu");
+	}
 	return nvenc_create_base(CODEC_HEVC, settings, encoder);
 }
 #endif
 
 static void *av1_nvenc_create(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	/* this encoder requires shared textures, this cannot be used on a
+	 * gpu other than the one OBS is currently running on. */
+	const int gpu = (int)obs_data_get_int(settings, "gpu");
+	if (gpu != 0) {
+		blog(LOG_INFO,
+		     "[jim-nvenc] different GPU selected by user, falling back to CPU");
+		return obs_encoder_create_rerouted(encoder,
+						   "jim_av1_nvenc_cpu");
+	}
+	return nvenc_create_base(CODEC_AV1, settings, encoder);
+}
+
+static void *h264_nvenc_cpu_create(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	return nvenc_create_base(CODEC_H264, settings, encoder);
+}
+
+#ifdef ENABLE_HEVC
+static void *hevc_nvenc_cpu_create(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	return nvenc_create_base(CODEC_HEVC, settings, encoder);
+}
+#endif
+
+static void *av1_nvenc_cpu_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
 	return nvenc_create_base(CODEC_AV1, settings, encoder);
 }
@@ -1212,6 +1307,9 @@ static void nvenc_destroy(void *data)
 	for (size_t i = 0; i < enc->textures.num; i++) {
 		nv_texture_free(enc, &enc->textures.array[i]);
 	}
+	for (size_t i = 0; i < enc->buffers.num; i++) {
+		nv_buffer_free(enc, &enc->buffers.array[i]);
+	}
 	for (size_t i = 0; i < enc->bitstreams.num; i++) {
 		nv_bitstream_free(enc, &enc->bitstreams.array[i]);
 	}
@@ -1235,6 +1333,7 @@ static void nvenc_destroy(void *data)
 	bfree(enc->sei);
 	circlebuf_free(&enc->dts_list);
 	da_free(enc->textures);
+	da_free(enc->buffers);
 	da_free(enc->bitstreams);
 	da_free(enc->input_textures);
 	da_free(enc->packet_data);
@@ -1484,6 +1583,101 @@ static bool nvenc_encode_tex(void *data, uint32_t handle, int64_t pts,
 	return true;
 }
 
+static bool nvenc_encode(void *data, struct encoder_frame *frame,
+			 struct encoder_packet *packet, bool *received_packet)
+{
+	struct nvenc_data *enc = data;
+	struct nv_bitstream *bs;
+	struct nv_buffer *buf;
+	NVENCSTATUS err;
+
+	bs = &enc->bitstreams.array[enc->next_bitstream];
+	buf = &enc->buffers.array[enc->next_bitstream];
+
+	circlebuf_push_back(&enc->dts_list, &frame->pts, sizeof(frame->pts));
+
+	/* ------------------------------------ */
+	/* copy to output buffer                */
+
+	NV_ENC_LOCK_INPUT_BUFFER lock_params = {0};
+	lock_params.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+	lock_params.inputBuffer = buf->ptr;
+	if (NV_FAILED(nv.nvEncLockInputBuffer(enc->session, &lock_params))) {
+		return false;
+	}
+	uint8_t *ptr = lock_params.bufferDataPtr;
+	int y_size = buf->width * buf->height;
+	if (obs_p010_tex_active()) {
+		y_size = y_size * 2; // p010 = 10bit + 6bit padding = 2byte
+	}
+	memcpy(ptr, frame->data[0], y_size);              // Copy Y
+	memcpy(ptr + y_size, frame->data[1], y_size / 2); // Copy UV
+	if (NV_FAILED(nv.nvEncUnlockInputBuffer(enc->session, buf->ptr))) {
+		return false;
+	}
+
+	/* ------------------------------------ */
+	/* do actual encode call                */
+
+	NV_ENC_PIC_PARAMS params = {0};
+	params.version = enc->codec == CODEC_AV1 ? NV_ENC_PIC_PARAMS_VER
+						 : NV_ENC_PIC_PARAMS_COMPAT_VER;
+	params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+	params.inputBuffer = buf->ptr;
+	params.bufferFmt = obs_p010_tex_active()
+				   ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+				   : NV_ENC_BUFFER_FORMAT_NV12;
+	params.inputTimeStamp = (uint64_t)frame->pts;
+	params.inputWidth = enc->cx;
+	params.inputHeight = enc->cy;
+	params.inputPitch = enc->cx;
+	params.outputBitstream = bs->ptr;
+
+	err = nv.nvEncEncodePicture(enc->session, &params);
+	if (err != NV_ENC_SUCCESS && err != NV_ENC_ERR_NEED_MORE_INPUT) {
+		nv_failed(enc->encoder, err, __FUNCTION__,
+			  "nvEncEncodePicture");
+		return false;
+	}
+
+	enc->encode_started = true;
+	enc->buffers_queued++;
+
+	if (++enc->next_bitstream == enc->buf_count) {
+		enc->next_bitstream = 0;
+	}
+
+	/* ------------------------------------ */
+	/* check for encoded packet and parse   */
+
+	if (!get_encoded_packet(enc, false)) {
+		return false;
+	}
+
+	/* ------------------------------------ */
+	/* output encoded packet                */
+
+	if (enc->packet_data.num) {
+		int64_t dts;
+		circlebuf_pop_front(&enc->dts_list, &dts, sizeof(dts));
+
+		/* subtract bframe delay from dts */
+		dts -= (int64_t)enc->bframes * packet->timebase_num;
+
+		*received_packet = true;
+		packet->data = enc->packet_data.array;
+		packet->size = enc->packet_data.num;
+		packet->type = OBS_ENCODER_VIDEO;
+		packet->pts = enc->packet_pts;
+		packet->dts = dts;
+		packet->keyframe = enc->packet_keyframe;
+	} else {
+		*received_packet = false;
+	}
+
+	return true;
+}
+
 extern void h264_nvenc_defaults(obs_data_t *settings);
 extern obs_properties_t *h264_nvenc_properties(void *unused);
 #ifdef ENABLE_HEVC
@@ -1563,6 +1757,55 @@ struct obs_encoder_info av1_nvenc_info = {
 	.destroy = nvenc_destroy,
 	.update = nvenc_update,
 	.encode_texture = nvenc_encode_tex,
+	.get_defaults = av1_nvenc_defaults,
+	.get_properties = av1_nvenc_properties,
+	.get_extra_data = nvenc_extra_data,
+};
+
+struct obs_encoder_info h264_nvenc_cpu_info = {
+	.id = "jim_nvenc_cpu",
+	.codec = "h264",
+	.type = OBS_ENCODER_VIDEO,
+	.caps = OBS_ENCODER_CAP_INTERNAL | OBS_ENCODER_CAP_DYN_BITRATE,
+	.get_name = h264_nvenc_get_name,
+	.create = h264_nvenc_cpu_create,
+	.destroy = nvenc_destroy,
+	.update = nvenc_update,
+	.encode = nvenc_encode,
+	.get_defaults = h264_nvenc_defaults,
+	.get_properties = h264_nvenc_properties,
+	.get_extra_data = nvenc_extra_data,
+	.get_sei_data = nvenc_sei_data,
+};
+
+#ifdef ENABLE_HEVC
+struct obs_encoder_info hevc_nvenc_cpu_info = {
+	.id = "jim_hevc_nvenc_cpu",
+	.codec = "hevc",
+	.type = OBS_ENCODER_VIDEO,
+	.caps = OBS_ENCODER_CAP_INTERNAL | OBS_ENCODER_CAP_DYN_BITRATE,
+	.get_name = hevc_nvenc_get_name,
+	.create = hevc_nvenc_cpu_create,
+	.destroy = nvenc_destroy,
+	.update = nvenc_update,
+	.encode = nvenc_encode,
+	.get_defaults = hevc_nvenc_defaults,
+	.get_properties = hevc_nvenc_properties,
+	.get_extra_data = nvenc_extra_data,
+	.get_sei_data = nvenc_sei_data,
+};
+#endif
+
+struct obs_encoder_info av1_nvenc_cpu_info = {
+	.id = "jim_av1_nvenc_cpu",
+	.codec = "av1",
+	.type = OBS_ENCODER_VIDEO,
+	.caps = OBS_ENCODER_CAP_INTERNAL | OBS_ENCODER_CAP_DYN_BITRATE,
+	.get_name = av1_nvenc_get_name,
+	.create = av1_nvenc_cpu_create,
+	.destroy = nvenc_destroy,
+	.update = nvenc_update,
+	.encode = nvenc_encode,
 	.get_defaults = av1_nvenc_defaults,
 	.get_properties = av1_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,

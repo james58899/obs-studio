@@ -240,6 +240,11 @@ extern struct obs_encoder_info h264_nvenc_info;
 extern struct obs_encoder_info hevc_nvenc_info;
 #endif
 extern struct obs_encoder_info av1_nvenc_info;
+extern struct obs_encoder_info h264_nvenc_cpu_info;
+#ifdef ENABLE_HEVC
+extern struct obs_encoder_info hevc_nvenc_cpu_info;
+#endif
+extern struct obs_encoder_info av1_nvenc_cpu_info;
 
 static bool enum_luids(void *param, uint32_t idx, uint64_t luid)
 {
@@ -319,15 +324,20 @@ fail:
 void jim_nvenc_load(bool h264, bool hevc, bool av1)
 {
 	pthread_mutex_init(&init_mutex, NULL);
-	if (h264)
+	if (h264) {
 		obs_register_encoder(&h264_nvenc_info);
+		obs_register_encoder(&h264_nvenc_cpu_info);
+	}
 #ifdef ENABLE_HEVC
-	if (hevc)
+	if (hevc) {
 		obs_register_encoder(&hevc_nvenc_info);
+		obs_register_encoder(&hevc_nvenc_cpu_info);
+	}
 #endif
-	if (av1 && av1_supported())
+	if (av1 && av1_supported()) {
 		obs_register_encoder(&av1_nvenc_info);
-	else
+		obs_register_encoder(&av1_nvenc_cpu_info);
+	} else
 		blog(LOG_WARNING, "[NVENC] AV1 is not supported");
 }
 
